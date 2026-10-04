@@ -8,18 +8,22 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
 
-func getInput() (string, error) {
-	scanner := bufio.NewScanner(os.Stdin)
+func getInput(scanner *bufio.Scanner) (string, error) {
+
 	fmt.Print("You > ")
-	scanner.Scan()
-	prompt := scanner.Text()
-	if len(prompt) == 0 {
-		return "", fmt.Errorf("Empty prompt")
+	successful := scanner.Scan()
+	if !successful {
+		if scanner.Err() == nil {
+			return "", io.EOF
+		}
+		return "", scanner.Err()
 	}
+	prompt := scanner.Text()
 	return prompt, nil
 }
 
@@ -38,23 +42,12 @@ type ContentBlock struct {
 	Text string `json:"text"`
 }
 
-func getClaudeResponse(prompt string) (string, error) {
+func getClaudeResponse(prompt, apiKey string, client *http.Client) (string, error) {
 
 	maxTokens := 1024
 	model := "claude-opus-5"
 
 	url := "https://api.anthropic.com/v1/messages"
-
-	err := godotenv.Load()
-	if err != nil {
-		return "", fmt.Errorf(".env file loading Failed| %w", err)
-	}
-
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-
-	if apiKey == "" {
-		return "", fmt.Errorf("apikey is not set")
-	}
 
 	inputMessages := map[string]string{
 		"content": prompt,
@@ -84,8 +77,6 @@ func getClaudeResponse(prompt string) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
-
-	client := &http.Client{}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -119,21 +110,63 @@ func getClaudeResponse(prompt string) (string, error) {
 
 func printResponse(response string) {
 	fmt.Println("Claude Reponse > ", response)
+	fmt.Println()
 }
 
 func main() {
-	prompt, err := getInput()
-	//fmt.Println("You Entered:   ", prompt)
+	//creating scanner object
+	scanner := bufio.NewScanner(os.Stdin)
+	//Loading env variables and getting the apiKey
+	err := godotenv.Load()
 	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	response, err := getClaudeResponse(prompt)
-	if err != nil {
-		//fmt.Println("ERROR OCCURED")
-		fmt.Println(err)
+		fmt.Println(".env file loading Failed| ", err)
 		return
 	}
 
-	printResponse(response)
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+
+	if apiKey == "" {
+		fmt.Println("apikey is not set")
+		return
+	}
+	//Creating the http Client for sending requests to the anthropic server
+	client := &http.Client{}
+
+	// main loop
+	for {
+		//first lets get the input
+		prompt, err := getInput(scanner)
+
+		if err == io.EOF {
+			fmt.Println("\nGood Bye!")
+			return
+		}
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		if len(prompt) == 0 {
+			fmt.Println("Empty prompt, Try again.")
+			continue
+		}
+
+		//now lets check if the input is quit
+		if strings.ToLower(strings.TrimSpace(prompt)) == "quit" {
+			fmt.Println("Good Bye!")
+			return
+		}
+
+		//if its a valid prompt lets send it to claude
+		response, err := getClaudeResponse(prompt, apiKey, client)
+		if err != nil {
+			//fmt.Println("ERROR OCCURED")
+			fmt.Println(err)
+			continue
+		}
+
+		printResponse(response)
+
+	}
+
 }
