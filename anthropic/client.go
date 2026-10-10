@@ -5,11 +5,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 )
+
+// ErrIncompleteStream is returned when the SSE body ends before a message_stop event.
+var ErrIncompleteStream = errors.New("anthropic: incomplete stream: missing message_stop")
 
 const (
 	DefaultBaseURL = "https://api.anthropic.com"
@@ -179,17 +183,24 @@ func readSSE(r io.Reader, onText func(string) error) (string, error) {
 		}
 	}
 	if !stopped {
-		if err := flush(); err != nil && err != errStreamDone {
-			return full.String(), err
+		if err := flush(); err != nil {
+			if err == errStreamDone {
+				stopped = true
+			} else {
+				return full.String(), err
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return full.String(), err
 	}
+	if !stopped {
+		return full.String(), ErrIncompleteStream
+	}
 	return full.String(), nil
 }
 
-var errStreamDone = fmt.Errorf("stream done")
+var errStreamDone = errors.New("stream done")
 
 func handleSSEEvent(ev sseEvent, full *strings.Builder, onText func(string) error) error {
 	event := ev.event
