@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -35,23 +36,67 @@ func main() {
 	}
 
 	client := anthropic.NewClient(apiKey)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	hub := newInterruptHub()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	go func() {
+		for range sigCh {
+			if hub.HandleSignal() {
+				// Idle interrupt: wake the prompt select so we can exit cleanly.
+				// HandleSignal already signaled hub.Wake().
+			}
+		}
+	}()
 
 	fmt.Fprintf(os.Stderr, "model %s — type /quit to exit, /reset to clear history\n", *model)
+	fmt.Fprintln(os.Stderr, "Ctrl+C cancels an in-flight reply; Ctrl+C at the prompt exits")
 
-	in := bufio.NewScanner(os.Stdin)
-	in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lines := make(chan string)
+	scanErr := make(chan error, 1)
+	go func() {
+		in := bufio.NewScanner(os.Stdin)
+		in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for in.Scan() {
+			lines <- in.Text()
+		}
+		if err := in.Err(); err != nil {
+			scanErr <- err
+		}
+		close(lines)
+	}()
+
 	out := bufio.NewWriter(os.Stdout)
-
 	var history []anthropic.Message
+
 	for {
 		fmt.Fprint(os.Stdout, "you> ")
-		if !in.Scan() {
+		_ = os.Stdout.Sync()
+
+		var line string
+		select {
+		case <-hub.Wake():
 			fmt.Fprintln(os.Stdout)
-			break
+			return
+		case err := <-scanErr:
+			fmt.Fprintln(os.Stdout)
+			fmt.Fprintf(os.Stderr, "stdin: %v\n", err)
+			os.Exit(1)
+		case text, ok := <-lines:
+			if !ok {
+				fmt.Fprintln(os.Stdout)
+				return
+			}
+			if hub.ExitRequested() {
+				fmt.Fprintln(os.Stdout)
+				return
+			}
+			line = text
 		}
-		line := strings.TrimSpace(in.Text())
+
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
@@ -75,18 +120,26 @@ func main() {
 		fmt.Fprint(os.Stdout, "claude> ")
 		_ = out.Flush()
 
-		text, err := client.Stream(ctx, req, func(delta string) error {
+		reqCtx, endReq := hub.BeginRequest(context.Background())
+		text, err := client.Stream(reqCtx, req, func(delta string) error {
 			_, werr := out.WriteString(delta)
 			if werr != nil {
 				return werr
 			}
 			return out.Flush()
 		})
+		endReq()
 		fmt.Fprintln(os.Stdout)
+
+		if hub.ExitRequested() {
+			return
+		}
+
 		if err != nil {
-			if ctx.Err() != nil {
-				fmt.Fprintln(os.Stderr, "interrupted")
-				return
+			if errors.Is(err, context.Canceled) || errors.Is(reqCtx.Err(), context.Canceled) {
+				fmt.Fprintln(os.Stderr, "interrupted — type another message, or Ctrl+C / /quit to exit")
+				history = history[:len(history)-1]
+				continue
 			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			history = history[:len(history)-1]
@@ -95,9 +148,5 @@ func main() {
 		if text != "" {
 			history = append(history, anthropic.Message{Role: "assistant", Content: text})
 		}
-	}
-	if err := in.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "stdin: %v\n", err)
-		os.Exit(1)
 	}
 }

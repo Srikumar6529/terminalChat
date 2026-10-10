@@ -40,10 +40,23 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
-	if e.Type != "" {
-		return fmt.Sprintf("anthropic: %s (%s, HTTP %d)", e.Message, e.Type, e.StatusCode)
+	if e == nil {
+		return "anthropic: <nil>"
 	}
-	return fmt.Sprintf("anthropic: %s (HTTP %d)", e.Message, e.StatusCode)
+	msg := e.Message
+	if msg == "" {
+		msg = "unknown error"
+	}
+	switch {
+	case e.Type != "" && e.StatusCode != 0:
+		return fmt.Sprintf("anthropic: %s (%s, HTTP %d)", msg, e.Type, e.StatusCode)
+	case e.Type != "":
+		return fmt.Sprintf("anthropic: %s (%s)", msg, e.Type)
+	case e.StatusCode != 0:
+		return fmt.Sprintf("anthropic: %s (HTTP %d)", msg, e.StatusCode)
+	default:
+		return "anthropic: " + msg
+	}
 }
 
 type Client struct {
@@ -113,22 +126,82 @@ func (c *Client) Stream(ctx context.Context, req Request, onText func(string) er
 }
 
 func readAPIError(resp *http.Response) error {
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var parsed struct {
-		Type  string `json:"type"`
-		Error struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    "failed to read error body: " + err.Error(),
+		}
 	}
-	if json.Unmarshal(raw, &parsed) == nil && parsed.Error.Message != "" {
-		return &APIError{StatusCode: resp.StatusCode, Type: parsed.Error.Type, Message: parsed.Error.Message}
+	return parseErrorBody(raw, resp.StatusCode)
+}
+
+// apiErrorObject is a pointer so JSON null / omitted nested error never panics.
+type apiErrorObject struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type apiErrorPayload struct {
+	Type  string          `json:"type"`
+	Error *apiErrorObject `json:"error"`
+}
+
+// parseErrorBody builds an APIError from an HTTP or SSE error payload.
+// statusCode may be 0 for stream-side errors (no HTTP status available).
+func parseErrorBody(raw []byte, statusCode int) *APIError {
+	trimmed := bytes.TrimSpace(raw)
+	fallback := statusFallbackMessage(statusCode)
+
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return &APIError{StatusCode: statusCode, Message: fallback}
 	}
-	msg := strings.TrimSpace(string(raw))
-	if msg == "" {
-		msg = resp.Status
+
+	var parsed apiErrorPayload
+	if err := json.Unmarshal(trimmed, &parsed); err == nil {
+		if parsed.Error != nil && strings.TrimSpace(parsed.Error.Message) != "" {
+			return &APIError{
+				StatusCode: statusCode,
+				Type:       parsed.Error.Type,
+				Message:    parsed.Error.Message,
+			}
+		}
+		if parsed.Type == "error" || parsed.Error != nil {
+			typ := ""
+			if parsed.Error != nil {
+				typ = parsed.Error.Type
+			}
+			return &APIError{StatusCode: statusCode, Type: typ, Message: fallback}
+		}
+		// Valid JSON that is not an Anthropic error object (e.g. {}).
+		return &APIError{StatusCode: statusCode, Message: fallback}
 	}
-	return &APIError{StatusCode: resp.StatusCode, Message: msg}
+
+	return &APIError{
+		StatusCode: statusCode,
+		Message:    sanitizeErrorMessage(string(trimmed)),
+	}
+}
+
+func statusFallbackMessage(statusCode int) string {
+	if statusCode != 0 {
+		if text := http.StatusText(statusCode); text != "" {
+			return text
+		}
+		return fmt.Sprintf("HTTP %d", statusCode)
+	}
+	return "stream error"
+}
+
+func sanitizeErrorMessage(msg string) string {
+	msg = strings.TrimSpace(msg)
+	// Avoid echoing secrets if a proxy or misconfigured server reflects them.
+	msg = strings.ReplaceAll(msg, "sk-ant-", "[redacted]")
+	const maxLen = 512
+	if len(msg) > maxLen {
+		return msg[:maxLen] + "..."
+	}
+	return msg
 }
 
 type sseEvent struct {
@@ -159,7 +232,7 @@ func readSSE(r io.Reader, onText func(string) error) (string, error) {
 		line := scanner.Text()
 		if line == "" {
 			if err := flush(); err != nil {
-				if err == errStreamDone {
+				if errors.Is(err, errStreamDone) {
 					stopped = true
 					break
 				}
@@ -184,7 +257,7 @@ func readSSE(r io.Reader, onText func(string) error) (string, error) {
 	}
 	if !stopped {
 		if err := flush(); err != nil {
-			if err == errStreamDone {
+			if errors.Is(err, errStreamDone) {
 				stopped = true
 			} else {
 				return full.String(), err
@@ -227,21 +300,14 @@ func handleSSEEvent(ev sseEvent, full *strings.Builder, onText func(string) erro
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"delta"`
-		Error struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Error *apiErrorObject `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(ev.data), &payload); err != nil {
 		return fmt.Errorf("anthropic: invalid SSE data: %w", err)
 	}
 
-	if payload.Type == "error" || payload.Error.Message != "" {
-		msg := payload.Error.Message
-		if msg == "" {
-			msg = "stream error"
-		}
-		return &APIError{Type: payload.Error.Type, Message: msg}
+	if payload.Type == "error" || (payload.Error != nil && strings.TrimSpace(payload.Error.Message) != "") {
+		return parseErrorBody([]byte(ev.data), 0)
 	}
 
 	if payload.Type == "content_block_delta" && payload.Delta.Type == "text_delta" && payload.Delta.Text != "" {
@@ -256,18 +322,5 @@ func handleSSEEvent(ev sseEvent, full *strings.Builder, onText func(string) erro
 }
 
 func parseStreamError(data string) error {
-	var payload struct {
-		Type  string `json:"type"`
-		Error struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal([]byte(data), &payload) == nil && payload.Error.Message != "" {
-		return &APIError{Type: payload.Error.Type, Message: payload.Error.Message}
-	}
-	if strings.TrimSpace(data) == "" {
-		return &APIError{Message: "stream error"}
-	}
-	return &APIError{Message: data}
+	return parseErrorBody([]byte(data), 0)
 }
