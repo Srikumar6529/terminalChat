@@ -1,6 +1,6 @@
-.PHONY: check fmt vet test race
+.PHONY: check fmt vet test race bench-test bench
 
-# Development hygiene checks (also used by CI).
+# Development hygiene checks (also used by CI). Root module is stdlib-only.
 check: fmt vet test race
 
 fmt:
@@ -14,3 +14,11 @@ test:
 
 race:
 	go test -race -count=1 ./...
+
+# Separate benchmarks module (pulls anthropic-sdk-go). Mock only by default.
+bench-test:
+	cd benchmarks && go test -count=1 ./...
+
+bench:
+	go test ./anthropic -bench='BenchmarkReadSSE|BenchmarkStream' -benchmem -count=3
+	cd benchmarks && go test -bench=BenchmarkCompare -benchmem -count=3 ./...

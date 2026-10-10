@@ -137,6 +137,15 @@ go vet ./...
 
 Tests use `httptest` and in-memory SSE fixtures. They do **not** call the live API by default.
 
+### Benchmarks
+
+Optional raw-vs-SDK measurements live in a **separate module** [`benchmarks/`](benchmarks/) so the CLI stays stdlib-only. See that README and [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+
+```bash
+make bench-test   # mock parity + concurrency (downloads SDK into benchmarks/)
+make bench        # microbenches + compare benches
+```
+
 ## Example session
 
 ```text
