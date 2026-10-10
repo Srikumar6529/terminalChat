@@ -27,7 +27,14 @@ func main() {
 	model := flag.String("model", defaultModel, "Anthropic model id")
 	maxTokens := flag.Int("max-tokens", 4096, "max output tokens")
 	system := flag.String("system", "", "optional system prompt")
+	headerTimeout := flag.Duration("header-timeout", anthropic.DefaultResponseHeaderTimeout,
+		"max time to wait for response headers (not the streamed body)")
 	flag.Parse()
+
+	if *headerTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "-header-timeout must be positive")
+		os.Exit(1)
+	}
 
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
@@ -35,7 +42,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := anthropic.NewClient(apiKey)
+	httpClient := anthropic.NewHTTPClient(anthropic.TransportConfig{
+		ResponseHeaderTimeout: *headerTimeout,
+	})
+	client := anthropic.NewClientWithHTTPClient(apiKey, httpClient)
 	hub := newInterruptHub()
 
 	sigCh := make(chan os.Signal, 1)

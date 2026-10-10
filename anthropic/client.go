@@ -65,11 +65,23 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+// NewClient returns a Client that reuses one HTTP client with connection-level
+// and response-header timeouts (see NewHTTPClient). It does not set an overall
+// http.Client.Timeout, so streamed bodies may run until the request context ends.
 func NewClient(apiKey string) *Client {
+	return NewClientWithHTTPClient(apiKey, NewHTTPClient(TransportConfig{}))
+}
+
+// NewClientWithHTTPClient is like NewClient but uses the provided HTTP client.
+// The same client instance is reused for every Stream call.
+func NewClientWithHTTPClient(apiKey string, httpClient *http.Client) *Client {
+	if httpClient == nil {
+		httpClient = NewHTTPClient(TransportConfig{})
+	}
 	return &Client{
 		APIKey:     apiKey,
 		BaseURL:    DefaultBaseURL,
-		HTTPClient: &http.Client{},
+		HTTPClient: httpClient,
 	}
 }
 
@@ -77,7 +89,7 @@ func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return http.DefaultClient
+	return NewHTTPClient(TransportConfig{})
 }
 
 func (c *Client) baseURL() string {
