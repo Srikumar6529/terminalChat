@@ -16,7 +16,6 @@ func TestRollbackLastUser(t *testing.T) {
 	if len(got) != 2 || got[1].Role != "assistant" {
 		t.Fatalf("got=%+v", got)
 	}
-	// Does not drop assistant if last role is not user.
 	got = rollbackLastUser(got)
 	if len(got) != 2 {
 		t.Fatalf("unexpected rollback: %+v", got)
@@ -26,14 +25,32 @@ func TestRollbackLastUser(t *testing.T) {
 	}
 }
 
-func TestAppendAssistant(t *testing.T) {
+func TestAppendAssistantKeepsEmpty(t *testing.T) {
 	h := []anthropic.Message{{Role: "user", Content: "a"}}
 	h = appendAssistant(h, "")
-	if len(h) != 1 {
-		t.Fatal("empty assistant should not append")
+	if len(h) != 2 || h[1].Role != "assistant" || h[1].Content != "" {
+		t.Fatalf("empty assistant should still append: %+v", h)
 	}
-	h = appendAssistant(h, "reply")
+	h = appendAssistant(h[:1], "reply")
 	if len(h) != 2 || h[1].Content != "reply" {
 		t.Fatalf("got=%+v", h)
+	}
+}
+
+func TestTrimHistory(t *testing.T) {
+	var h []anthropic.Message
+	for i := 0; i < maxHistoryMessages+4; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		h = append(h, anthropic.Message{Role: role, Content: "x"})
+	}
+	got := trimHistory(h)
+	if len(got) > maxHistoryMessages {
+		t.Fatalf("len=%d", len(got))
+	}
+	if len(got) == 0 || got[0].Role != "user" {
+		t.Fatalf("should start on user: %+v", got)
 	}
 }

@@ -32,10 +32,10 @@ func TestFinishTurnSuccessAfterPriorFailure(t *testing.T) {
 	}
 }
 
-func TestFinishTurnEmptySuccess(t *testing.T) {
+func TestFinishTurnEmptySuccessKeepsAlternation(t *testing.T) {
 	h := []anthropic.Message{{Role: "user", Content: "q"}}
 	got := finishTurn(h, "", nil)
-	if len(got) != 1 {
-		t.Fatalf("empty assistant should not append: %+v", got)
+	if len(got) != 2 || got[1].Role != "assistant" {
+		t.Fatalf("empty success should append assistant: %+v", got)
 	}
 }

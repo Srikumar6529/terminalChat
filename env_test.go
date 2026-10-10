@@ -68,6 +68,22 @@ func TestLoadDotEnvDoesNotOverrideExisting(t *testing.T) {
 	}
 }
 
+func TestLoadDotEnvEmptyEnvBlocksFile(t *testing.T) {
+	// LookupEnv treats empty-but-set as present; .env must not override.
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("ANTHROPIC_API_KEY=from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	if err := loadDotEnv(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := os.Getenv("ANTHROPIC_API_KEY"); got != "" {
+		t.Fatalf("empty env should win over .env, got %q", got)
+	}
+}
+
 func TestLoadDotEnvSkipsMalformedLines(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".env")

@@ -120,10 +120,11 @@ This avoids cutting off legitimate long generations.
 ## Known limitations
 
 - Text-only chat (no tools, images, or files).
-- History is in-memory only for the process lifetime.
+- History is in-memory only for the process lifetime (capped at 40 messages; oldest turns are dropped).
 - No automatic retries (avoids duplicating streamed tokens).
 - Not a production SDK replacement; no SLA or security audit claimed.
 - After `message_stop`, unread body bytes may not be fully drained before close.
+- If a stream is canceled, `Stream` returns an error satisfying `errors.Is(err, context.Canceled)` (often wrapping `ErrIncompleteStream`).
 
 ## Development
 

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStreamAccumulatesTextDeltas(t *testing.T) {
@@ -216,7 +217,8 @@ func TestParseErrorBodyCases(t *testing.T) {
 		{name: "plain text", raw: " upstream blew up ", status: 502, wantMsg: "upstream blew up", wantStatus: 502},
 		{name: "stream empty", raw: "", status: 0, wantMsg: "stream error", wantStatus: 0},
 		{name: "stream full", raw: `{"type":"error","error":{"type":"overloaded_error","message":"try again"}}`, status: 0, wantType: "overloaded_error", wantMsg: "try again", wantStatus: 0},
-		{name: "redacts key prefix", raw: "bad sk-ant-secret-value here", status: 400, wantMsg: "bad [redacted]secret-value here", wantStatus: 400},
+		{name: "redacts api key", raw: "bad sk-ant-secret-value-12345678 here", status: 400, wantMsg: "bad [redacted] here", wantStatus: 400},
+		{name: "redacts x-api-key", raw: "x-api-key: super-secret-token", status: 400, wantMsg: "[redacted]", wantStatus: 400},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -432,5 +434,68 @@ func TestReadSSECRLF(t *testing.T) {
 	}
 	if text != "crlf" {
 		t.Fatalf("text = %q", text)
+	}
+}
+
+func TestStreamCanceledIncompleteIsContextCanceled(t *testing.T) {
+	started := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		close(started)
+		// Hang until the client cancels and the connection drops.
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	c := NewClient("test-key")
+	c.BaseURL = ts.URL
+	c.HTTPClient = ts.Client()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	var text string
+	go func() {
+		var err error
+		text, err = c.Stream(ctx, Request{Model: "x", Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
+		errCh <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not start streaming")
+	}
+	cancel()
+
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if text != "partial" && text != "" {
+		// Partial text may or may not have been delivered before cancel.
+		t.Logf("text = %q", text)
+	}
+}
+
+func TestStreamRejectsJSONContentType(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer ts.Close()
+
+	c := NewClient("test-key")
+	c.BaseURL = ts.URL
+	c.HTTPClient = ts.Client()
+	_, err := c.Stream(context.Background(), Request{Model: "x", Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "Content-Type") {
+		t.Fatalf("err = %v", err)
 	}
 }

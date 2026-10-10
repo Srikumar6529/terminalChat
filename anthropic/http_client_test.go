@@ -83,8 +83,8 @@ func TestCancelThenSuccessfulRequest(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected cancel error")
 		}
-		if !errors.Is(err, context.Canceled) && !errors.Is(ctx.Err(), context.Canceled) {
-			t.Fatalf("err = %v, want canceled", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("canceled Stream did not return")

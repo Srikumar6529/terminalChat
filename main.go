@@ -50,7 +50,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "model %s — type /help for commands\n", cfg.Model)
 	fmt.Fprintln(os.Stderr, "Ctrl+C cancels an in-flight reply; Ctrl+C at the prompt exits")
 
-	lines := make(chan string)
+	// Buffer one line so a typed message during streaming does not block the
+	// scanner forever if the REPL exits before the next read.
+	lines := make(chan string, 1)
 	scanErr := make(chan error, 1)
 	go func() {
 		in := bufio.NewScanner(os.Stdin)
@@ -83,6 +85,11 @@ func main() {
 			return
 		case err := <-scanErr:
 			fmt.Fprintln(os.Stdout)
+			// Ctrl+C at the prompt often interrupts Scan with EINTR as well as
+			// signaling the hub; prefer a clean zero exit over "stdin: ...".
+			if hub.ExitRequested() || isBenignStdinInterrupt(err) {
+				return
+			}
 			fmt.Fprintf(os.Stderr, "stdin: %v\n", err)
 			os.Exit(1)
 		case text, ok := <-lines:
@@ -114,6 +121,7 @@ func main() {
 		}
 
 		history = append(history, anthropic.Message{Role: "user", Content: line})
+		history = trimHistory(history)
 		req := anthropic.Request{
 			Model:     cfg.Model,
 			MaxTokens: cfg.MaxTokens,
@@ -141,7 +149,7 @@ func main() {
 		}
 
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(reqCtx.Err(), context.Canceled) {
+			if errors.Is(err, context.Canceled) {
 				fmt.Fprintln(os.Stderr, "interrupted — reply not saved; type another message, or Ctrl+C / /quit to exit")
 			} else {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -151,5 +159,6 @@ func main() {
 			continue
 		}
 		history = finishTurn(history, text, nil)
+		history = trimHistory(history)
 	}
 }

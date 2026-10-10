@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -90,7 +91,9 @@ func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return NewHTTPClient(TransportConfig{})
+	// Lazily install a shared client so repeated Stream calls reuse connections.
+	c.HTTPClient = NewHTTPClient(TransportConfig{})
+	return c.HTTPClient
 }
 
 func (c *Client) baseURL() string {
@@ -145,7 +148,7 @@ func (c *Client) Stream(ctx context.Context, req Request, onText func(string) er
 
 	resp, err := c.httpClient().Do(httpReq)
 	if err != nil {
-		return "", err
+		return "", annotateCtxErr(ctx, err)
 	}
 	defer resp.Body.Close()
 
@@ -153,7 +156,34 @@ func (c *Client) Stream(ctx context.Context, req Request, onText func(string) er
 		return "", readAPIError(resp)
 	}
 
-	return readSSE(resp.Body, onText)
+	if ct := resp.Header.Get("Content-Type"); ct != "" && strings.Contains(ct, "application/json") {
+		return "", fmt.Errorf("anthropic: unexpected Content-Type %q for stream=true (want text/event-stream)", ct)
+	}
+
+	text, err := readSSE(resp.Body, onText)
+	if err != nil {
+		return text, annotateCtxErr(ctx, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return text, err
+	}
+	return text, nil
+}
+
+// annotateCtxErr ensures callers can use errors.Is(err, context.Canceled|DeadlineExceeded)
+// when the request context ended, even if the transport/SSE layer returned a different error
+// (commonly ErrIncompleteStream after a canceled body).
+func annotateCtxErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(err, ctxErr) {
+			return err
+		}
+		return fmt.Errorf("%w: %w", ctxErr, err)
+	}
+	return err
 }
 
 func readAPIError(resp *http.Response) error {
@@ -224,10 +254,14 @@ func statusFallbackMessage(statusCode int) string {
 	return "stream error"
 }
 
+var (
+	secretKeyPattern = regexp.MustCompile(`(?i)(sk-ant-[a-z0-9_\-]{8,}|x-api-key\s*[:=]\s*\S+)`)
+)
+
 func sanitizeErrorMessage(msg string) string {
 	msg = strings.TrimSpace(msg)
 	// Avoid echoing secrets if a proxy or misconfigured server reflects them.
-	msg = strings.ReplaceAll(msg, "sk-ant-", "[redacted]")
+	msg = secretKeyPattern.ReplaceAllString(msg, "[redacted]")
 	const maxLen = 512
 	if len(msg) > maxLen {
 		return msg[:maxLen] + "..."
