@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -99,6 +100,19 @@ func (c *Client) baseURL() string {
 	return DefaultBaseURL
 }
 
+// messagesURL builds POST /v1/messages against BaseURL (origin only, no /v1 suffix).
+func (c *Client) messagesURL() (string, error) {
+	raw := c.baseURL()
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("anthropic: invalid base URL %q: %w", raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("anthropic: invalid base URL %q: missing scheme or host", raw)
+	}
+	return u.JoinPath("v1", "messages").String(), nil
+}
+
 // Stream posts to /v1/messages with stream:true, calls onText for each text_delta,
 // and returns the concatenated assistant text.
 func (c *Client) Stream(ctx context.Context, req Request, onText func(string) error) (string, error) {
@@ -110,12 +124,17 @@ func (c *Client) Stream(ctx context.Context, req Request, onText func(string) er
 		req.MaxTokens = 4096
 	}
 
+	endpoint, err := c.messagesURL()
+	if err != nil {
+		return "", err
+	}
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return "", err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL()+"/v1/messages", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -253,9 +272,14 @@ func readSSE(r io.Reader, onText func(string) error) (string, error) {
 			continue
 		}
 		if strings.HasPrefix(line, ":") {
+			// SSE comment / keep-alive
 			continue
 		}
-		field, value, _ := strings.Cut(line, ":")
+		field, value, ok := strings.Cut(line, ":")
+		if !ok {
+			// Per SSE, a line without ':' is a field name with empty value; ignore.
+			continue
+		}
 		value = strings.TrimPrefix(value, " ")
 		switch field {
 		case "event":
@@ -265,6 +289,10 @@ func readSSE(r io.Reader, onText func(string) error) (string, error) {
 				cur.data += "\n"
 			}
 			cur.data += value
+		case "id", "retry":
+			// Recognized SSE fields; unused by this client.
+		default:
+			// Unknown fields are ignored for forward compatibility.
 		}
 	}
 	if !stopped {
@@ -289,12 +317,11 @@ var errStreamDone = errors.New("stream done")
 
 func handleSSEEvent(ev sseEvent, full *strings.Builder, onText func(string) error) error {
 	event := ev.event
-	if event == "" {
-		event = "message"
-	}
 
+	// Documented Anthropic stream events that carry no assistant text for this client.
+	// Ignore without requiring JSON so optional/unknown fields cannot break the stream.
 	switch event {
-	case "ping":
+	case "ping", "message_start", "content_block_start", "content_block_stop", "message_delta":
 		return nil
 	case "message_stop":
 		return errStreamDone
@@ -308,7 +335,7 @@ func handleSSEEvent(ev sseEvent, full *strings.Builder, onText func(string) erro
 
 	var payload struct {
 		Type  string `json:"type"`
-		Delta struct {
+		Delta *struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"delta"`
@@ -318,18 +345,38 @@ func handleSSEEvent(ev sseEvent, full *strings.Builder, onText func(string) erro
 		return fmt.Errorf("anthropic: invalid SSE data: %w", err)
 	}
 
-	if payload.Type == "error" || (payload.Error != nil && strings.TrimSpace(payload.Error.Message) != "") {
+	// Prefer data.type when the SSE event: field is missing or unknown.
+	switch payload.Type {
+	case "message_stop":
+		return errStreamDone
+	case "ping", "message_start", "content_block_start", "content_block_stop", "message_delta":
+		return nil
+	case "error":
 		return parseErrorBody([]byte(ev.data), 0)
 	}
 
-	if payload.Type == "content_block_delta" && payload.Delta.Type == "text_delta" && payload.Delta.Text != "" {
+	if payload.Error != nil && strings.TrimSpace(payload.Error.Message) != "" {
+		return parseErrorBody([]byte(ev.data), 0)
+	}
+
+	if payload.Type == "content_block_delta" {
+		if payload.Delta == nil || payload.Delta.Type != "text_delta" {
+			// e.g. input_json_delta / thinking_delta — ignore for text-only client
+			return nil
+		}
+		if payload.Delta.Text == "" {
+			return nil
+		}
 		full.WriteString(payload.Delta.Text)
 		if onText != nil {
 			if err := onText(payload.Delta.Text); err != nil {
 				return err
 			}
 		}
+		return nil
 	}
+
+	// Unknown event/type combinations are ignored for forward compatibility.
 	return nil
 }
 

@@ -272,3 +272,165 @@ func TestParseStreamErrorConsistentWithHTTP(t *testing.T) {
 		t.Fatalf("status stream=%d http=%d", streamErr.StatusCode, httpErr.StatusCode)
 	}
 }
+
+func TestMessagesURL(t *testing.T) {
+	c := NewClient("k")
+	c.BaseURL = "https://example.com/"
+	got, err := c.messagesURL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://example.com/v1/messages" {
+		t.Fatalf("url = %q", got)
+	}
+	c.BaseURL = "not a url"
+	if _, err := c.messagesURL(); err == nil {
+		t.Fatal("expected invalid base URL error")
+	}
+}
+
+func TestStreamBaseURLTrailingSlash(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer ts.Close()
+
+	c := NewClient("test-key")
+	c.BaseURL = ts.URL + "/"
+	c.HTTPClient = ts.Client()
+	if _, err := c.Stream(context.Background(), Request{Model: "x", Messages: []Message{{Role: "user", Content: "hi"}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadSSECommentsAndUnknownFields(t *testing.T) {
+	body := "" +
+		": keep-alive\n" +
+		"event: content_block_delta\n" +
+		"id: evt_1\n" +
+		"retry: 1000\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"},\"extra\":123}\n" +
+		"\n" +
+		"event: future_event\n" +
+		"data: {\"type\":\"future_type\",\"foo\":true}\n" +
+		"\n" +
+		"event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n" +
+		"\n"
+	text, err := readSSE(strings.NewReader(body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "hi" {
+		t.Fatalf("text = %q", text)
+	}
+}
+
+func TestReadSSEMultilineData(t *testing.T) {
+	body := "" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\n" +
+		"data: \"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n" +
+		"\n" +
+		"event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n" +
+		"\n"
+	text, err := readSSE(strings.NewReader(body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "Hi" {
+		t.Fatalf("text = %q", text)
+	}
+}
+
+func TestReadSSEEmptyTextDeltaIgnored(t *testing.T) {
+	calls := 0
+	body := "" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	text, err := readSSE(strings.NewReader(body), func(string) error {
+		calls++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "x" || calls != 1 {
+		t.Fatalf("text=%q calls=%d", text, calls)
+	}
+}
+
+func TestReadSSEIgnoresNonTextDeltaTypes(t *testing.T) {
+	body := "" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"t\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	text, err := readSSE(strings.NewReader(body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "t" {
+		t.Fatalf("text = %q", text)
+	}
+}
+
+func TestReadSSEKnownEventsSkipJSON(t *testing.T) {
+	// message_start with broken JSON must not fail the stream.
+	body := "" +
+		"event: message_start\ndata: {not-json\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n" +
+		"event: message_delta\ndata: {also-bad\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	text, err := readSSE(strings.NewReader(body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "a" {
+		t.Fatalf("text = %q", text)
+	}
+}
+
+func TestReadSSEDataTypeMessageStopWithoutEventField(t *testing.T) {
+	body := "data: {\"type\":\"message_stop\"}\n\n"
+	if _, err := readSSE(strings.NewReader(body), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadSSEErrorAfterPartialText(t *testing.T) {
+	body := "" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}\n\n"
+	var deltas []string
+	text, err := readSSE(strings.NewReader(body), func(s string) error {
+		deltas = append(deltas, s)
+		return nil
+	})
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("err type %T: %v", err, err)
+	}
+	if apiErr.Message != "boom" {
+		t.Fatalf("err = %+v", apiErr)
+	}
+	if text != "partial" || strings.Join(deltas, "") != "partial" {
+		t.Fatalf("text=%q deltas=%q", text, deltas)
+	}
+}
+
+func TestReadSSECRLF(t *testing.T) {
+	body := "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"crlf\"}}\r\n\r\nevent: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
+	text, err := readSSE(strings.NewReader(body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "crlf" {
+		t.Fatalf("text = %q", text)
+	}
+}
