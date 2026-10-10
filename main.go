@@ -19,33 +19,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	defaultModel := os.Getenv("ANTHROPIC_MODEL")
-	if defaultModel == "" {
-		defaultModel = "claude-sonnet-4-5"
-	}
-
-	model := flag.String("model", defaultModel, "Anthropic model id")
-	maxTokens := flag.Int("max-tokens", 4096, "max output tokens")
-	system := flag.String("system", "", "optional system prompt")
-	headerTimeout := flag.Duration("header-timeout", anthropic.DefaultResponseHeaderTimeout,
-		"max time to wait for response headers (not the streamed body)")
-	flag.Parse()
-
-	if *headerTimeout <= 0 {
-		fmt.Fprintln(os.Stderr, "-header-timeout must be positive")
-		os.Exit(1)
-	}
-
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "ANTHROPIC_API_KEY is not set")
-		os.Exit(1)
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	cfg, err := loadConfig(fs, os.Args[1:], os.Getenv)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "usage error: %v\n", err)
+		fmt.Fprintln(os.Stderr, "run with -h for flags; config: CLI > env/.env > defaults")
+		os.Exit(2)
 	}
 
 	httpClient := anthropic.NewHTTPClient(anthropic.TransportConfig{
-		ResponseHeaderTimeout: *headerTimeout,
+		ResponseHeaderTimeout: cfg.HeaderTimeout,
 	})
-	client := anthropic.NewClientWithHTTPClient(apiKey, httpClient)
+	client := anthropic.NewClientWithHTTPClient(cfg.APIKey, httpClient)
 	hub := newInterruptHub()
 
 	sigCh := make(chan os.Signal, 1)
@@ -54,26 +43,28 @@ func main() {
 
 	go func() {
 		for range sigCh {
-			if hub.HandleSignal() {
-				// Idle interrupt: wake the prompt select so we can exit cleanly.
-				// HandleSignal already signaled hub.Wake().
-			}
+			hub.HandleSignal()
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "model %s — type /quit to exit, /reset to clear history\n", *model)
+	fmt.Fprintf(os.Stderr, "model %s — type /help for commands\n", cfg.Model)
 	fmt.Fprintln(os.Stderr, "Ctrl+C cancels an in-flight reply; Ctrl+C at the prompt exits")
 
 	lines := make(chan string)
 	scanErr := make(chan error, 1)
 	go func() {
 		in := bufio.NewScanner(os.Stdin)
-		in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		in.Buffer(make([]byte, 0, 64*1024), maxInputBytes)
 		for in.Scan() {
 			lines <- in.Text()
 		}
 		if err := in.Err(); err != nil {
+			if errors.Is(err, bufio.ErrTooLong) {
+				scanErr <- fmt.Errorf("input line exceeds %d bytes; shorten the message and restart", maxInputBytes)
+				return
+			}
 			scanErr <- err
+			return
 		}
 		close(lines)
 	}()
@@ -113,6 +104,9 @@ func main() {
 		switch line {
 		case "/quit", "/exit":
 			return
+		case "/help":
+			printHelp()
+			continue
 		case "/reset":
 			history = nil
 			fmt.Fprintln(os.Stderr, "history cleared")
@@ -121,9 +115,9 @@ func main() {
 
 		history = append(history, anthropic.Message{Role: "user", Content: line})
 		req := anthropic.Request{
-			Model:     *model,
-			MaxTokens: *maxTokens,
-			System:    *system,
+			Model:     cfg.Model,
+			MaxTokens: cfg.MaxTokens,
+			System:    cfg.System,
 			Messages:  history,
 		}
 
@@ -140,6 +134,7 @@ func main() {
 		})
 		endReq()
 		fmt.Fprintln(os.Stdout)
+		_ = out.Flush()
 
 		if hub.ExitRequested() {
 			return
@@ -147,16 +142,15 @@ func main() {
 
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(reqCtx.Err(), context.Canceled) {
-				fmt.Fprintln(os.Stderr, "interrupted — type another message, or Ctrl+C / /quit to exit")
-				history = history[:len(history)-1]
+				fmt.Fprintln(os.Stderr, "interrupted — reply not saved; type another message, or Ctrl+C / /quit to exit")
+				history = rollbackLastUser(history)
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			history = history[:len(history)-1]
+			fmt.Fprintln(os.Stderr, "reply not saved; conversation rolled back to before your last message")
+			history = rollbackLastUser(history)
 			continue
 		}
-		if text != "" {
-			history = append(history, anthropic.Message{Role: "assistant", Content: text})
-		}
+		history = appendAssistant(history, text)
 	}
 }
