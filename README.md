@@ -55,8 +55,8 @@ flowchart LR
 ## Setup
 
 ```bash
-git clone <this-repo>
-cd terminalChat_AI_written
+git clone https://github.com/Srikumar6529/terminalChat.git
+cd terminalChat
 cp .env.example .env
 # edit .env and set ANTHROPIC_API_KEY=sk-ant-...
 ```
@@ -152,4 +152,4 @@ you> /quit
 
 ## License
 
-Use and modify for learning and portfolio purposes as you see fit unless a LICENSE file says otherwise.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).

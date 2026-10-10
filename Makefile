@@ -1,6 +1,6 @@
 .PHONY: check fmt vet test race
 
-# Development hygiene checks for Stage 7+.
+# Development hygiene checks (also used by CI).
 check: fmt vet test race
 
 fmt:
@@ -10,7 +10,7 @@ vet:
 	go vet ./...
 
 test:
-	go test ./...
+	go test -count=1 ./...
 
 race:
-	go test -race ./...
+	go test -race -count=1 ./...
