@@ -143,14 +143,13 @@ func main() {
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(reqCtx.Err(), context.Canceled) {
 				fmt.Fprintln(os.Stderr, "interrupted — reply not saved; type another message, or Ctrl+C / /quit to exit")
-				history = rollbackLastUser(history)
-				continue
+			} else {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				fmt.Fprintln(os.Stderr, "reply not saved; conversation rolled back to before your last message")
 			}
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			fmt.Fprintln(os.Stderr, "reply not saved; conversation rolled back to before your last message")
-			history = rollbackLastUser(history)
+			history = finishTurn(history, text, err)
 			continue
 		}
-		history = appendAssistant(history, text)
+		history = finishTurn(history, text, nil)
 	}
 }

@@ -67,3 +67,28 @@ func TestLoadDotEnvDoesNotOverrideExisting(t *testing.T) {
 		t.Fatalf("ANTHROPIC_API_KEY = %q", got)
 	}
 }
+
+func TestLoadDotEnvSkipsMalformedLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	content := "" +
+		"not-a-assignment\n" +
+		"=nokey\n" +
+		"# comment\n" +
+		"ANTHROPIC_API_KEY=ok\n" +
+		"ANTHROPIC_MODEL\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unsetEnvForTest(t, "ANTHROPIC_API_KEY")
+	unsetEnvForTest(t, "ANTHROPIC_MODEL")
+	if err := loadDotEnv(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := os.Getenv("ANTHROPIC_API_KEY"); got != "ok" {
+		t.Fatalf("ANTHROPIC_API_KEY = %q", got)
+	}
+	if _, ok := os.LookupEnv("ANTHROPIC_MODEL"); ok {
+		t.Fatal("malformed ANTHROPIC_MODEL line should not set the variable")
+	}
+}

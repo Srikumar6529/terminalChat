@@ -103,6 +103,39 @@ func TestCancelThenSuccessfulRequest(t *testing.T) {
 	}
 }
 
+func TestHTTPErrorThenSuccessfulRequest(t *testing.T) {
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer ts.Close()
+
+	c := NewClientWithHTTPClient("test-key", NewHTTPClient(TransportConfig{}))
+	c.BaseURL = ts.URL
+
+	_, err := c.Stream(context.Background(), Request{Model: "x", Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.StatusCode != 429 {
+		t.Fatalf("first err = %v", err)
+	}
+
+	text, err := c.Stream(context.Background(), Request{Model: "x", Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "ok" {
+		t.Fatalf("text = %q", text)
+	}
+}
+
 func TestNewHTTPClientHasNoOverallTimeout(t *testing.T) {
 	c := NewHTTPClient(TransportConfig{})
 	if c.Timeout != 0 {
